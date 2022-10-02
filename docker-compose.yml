@@ -1,0 +1,36 @@
+version: '3.7'
+services:
+  localstack:
+    image: localstack/localstack
+    hostname: localstack
+    ports:
+      - '4566:4566'
+    environment:
+      - SERVICES=sns,dynamodb,sqs
+      - DATA_DIR=/tmp/localstack/data
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - './.docker/localstack:/tmp/localstack'
+      - './setup-localstack.sh:/docker-entrypoint-initaws.d/setup-localstack.sh'
+  dynamodb-gui:
+    image: 'aaronshaf/dynamodb-admin'
+    ports:
+      - '8001:8001'
+    container_name: dynamodb-gui
+    hostname: dynamodb-gui
+    restart: always
+    environment:
+      - DYNAMO_ENDPOINT=localstack:4566
+    depends_on:
+      - localstack
+  app:
+    build:
+      context: ./
+      dockerfile: ./docker/Dockerfile.dev
+    volumes:
+      - .:/usr/app/
+    environment:
+      - KYC_DYNAMO_URL=http://localstack:4566
+      - KYC_SNS_URL=http://localstack:4566
+    depends_on:
+      - localstack
