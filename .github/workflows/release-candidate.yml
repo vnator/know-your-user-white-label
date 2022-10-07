@@ -1,0 +1,73 @@
+name: Release PR
+on:
+  pull_request:
+    paths:
+      - 'package.json'
+    branches:
+      - main
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: get-npm-version
+        id: package-version
+        uses: martinbeentjes/npm-get-version-action@master
+
+      - uses: actions-ecosystem/action-get-latest-tag@v1
+        id: get-latest-tag
+        with:
+          semver_only: true
+          with_initial_version: true
+          initial_version: ${{ steps.package-version.outputs.current-version }}
+
+      - name: Should create release
+        id: create_release
+        if: ${{ steps.package-version.outputs.current-version != steps.get-latest-tag.outputs.tag }}
+        run: echo "::set-output name=should_create::true"
+
+      - name: Generate changelog
+        id: changelog
+        uses: jaywcjlove/changelog-generator@main
+        if: steps.create_release.outputs.should_create
+        with:
+          head-ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - uses: jhserodio/semver-release-type@v1
+        id: new-version
+        with:
+          current_version: ${{ steps.get-latest-tag.outputs.tag }}
+          next_version: ${{ steps.package-version.outputs.current-version }}
+
+      - uses: actions-ecosystem/action-add-labels@v1
+        with:
+          labels: |
+            release-${{ steps.new-version.outputs.release_type }}
+
+      - name: Notify new release
+        if: ${{ steps.create_release.outputs.should_create }}  }}
+        uses: actions/github-script@0.9.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Release \`${{ steps.package-version.outputs.current-version }}\` will be created
+            if you don't want to create a new production release, please undo \`package.json\` changes, and also remove release labels.
+            #### Changelog 📖
+
+            <details><summary>Show Changelog</summary>
+
+            ${{ steps.changelog.outputs.changelog || '' }}
+
+            </details>
+            `;
+
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })

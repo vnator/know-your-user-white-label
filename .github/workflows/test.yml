@@ -1,0 +1,47 @@
+name: 'Checks'
+on:
+  pull_request:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    name: 'coverage'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - uses: actions/setup-node@v3
+        if: success()
+        with:
+          node-version: 16
+          cache: 'yarn'
+
+      - name: generate coverage
+        if: success()
+        id: coverage
+        uses: ArtiomTr/jest-coverage-report-action@v2
+        with:
+          package-manager: yarn
+          test-script: yarn test:unit
+          github-token: ${{ github.token }}
+
+  lint:
+    name: 'lint'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: cache dependencies
+        if: success()
+        uses: actions/setup-node@v3
+        with:
+          node-version: 16
+          cache: 'yarn'
+
+      - name: Run linters
+        if: success()
+        run: |
+          npx yarn install
+          npm run lint

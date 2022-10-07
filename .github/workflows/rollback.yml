@@ -1,0 +1,72 @@
+name: Rollback
+on:
+  workflow_dispatch:
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.latest-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v2
+
+      - id: latest-version
+        run: |
+          git fetch --tags
+          PREVIOUS_TAG=$(git describe --abbrev=0 --tags `git rev-list --tags --skip=1 --max-count=1`)
+          echo "Rollback to version ${PREVIOUS_TAG}"
+          echo "::set-output name=version::${PREVIOUS_TAG}"
+
+  call-rollback:
+    needs: [rollback]
+    uses: ./.github/workflows/deploy-infra.yml
+    with:
+      environment: prod
+      apply: true
+      version: ${{ needs.rollback.outputs.version }}
+    secrets:
+      GIT_CREDENTIALS: ${{ secrets.GIT_CREDENTIALS }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCESS_KEY_ID_PROD: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+      AWS_SECRET_ACCESS_KEY_PROD: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+
+  delete-release-image:
+    needs: [call-rollback]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Configure AWS credentials production
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+
+      - uses: actions-ecosystem/action-get-latest-tag@v1
+        id: get-latest-tag
+        with:
+          semver_only: true
+
+      - name: Delete remote image
+        run: |
+          aws ecr batch-delete-image \
+          --repository-name prod/acquisition/repository \
+          --image-ids imageTag=${{ steps.get-latest-tag.outputs.tag }} \
+          --region ${{ secrets.AWS_REGION }}
+
+      - name: Delete release
+        uses: actions/github-script@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo
+            const { data: { id, tag_name } } = await github.repos.getLatestRelease({ owner, repo })
+            console.log(`Deleting release ${id}`)
+            if (tag_name === '${{ steps.get-latest-tag.outputs.tag }}') {
+              await github.repos.deleteRelease({ owner, repo, release_id: id })
+            }
+            await github.git.deleteRef({
+              owner,
+              repo,
+              ref: `tags/${{ steps.get-latest-tag.outputs.tag }}`,
+            });

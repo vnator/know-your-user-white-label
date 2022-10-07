@@ -1,0 +1,6 @@
+FROM node:16
+WORKDIR /usr/app
+# COPY package*.json ./
+COPY . .
+COPY .env.example ./.env
+RUN npx yarn install

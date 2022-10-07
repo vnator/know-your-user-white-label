@@ -1,0 +1,199 @@
+name: 'Terraform'
+
+on:
+  push:
+    paths:
+      - 'infrastructure/**'
+    branches:
+      - main
+  pull_request:
+    paths:
+      - 'infrastructure/**'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'environment to be deployed'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      branch-name:
+        description: 'Branch name'
+        required: true
+        default: 'main'
+      apply:
+        description: 'Apply terraform changes'
+        required: true
+        type: boolean
+        default: false
+      version:
+        description: 'Release version'
+        required: true
+        type: string
+        default: 'latest'
+
+  workflow_call:
+    inputs:
+      environment:
+        description: 'environment to be deployed'
+        required: true
+        type: string
+      apply:
+        description: 'Apply terraform changes'
+        required: true
+        type: boolean
+      version:
+        description: 'Release version'
+        required: true
+        type: string
+    secrets:
+      GIT_CREDENTIALS:
+        required: true
+      AWS_REGION:
+        required: true
+      AWS_ACCESS_KEY_ID_PROD:
+        required: true
+      AWS_SECRET_ACCESS_KEY_PROD:
+        required: true
+      NEW_RELIC_INSERT_API_KEY:
+        required: true
+      INGESTION_API_KEY_PROD:
+        required: true
+
+jobs:
+  terraform:
+    name: 'Deploy on aws'
+    runs-on: ubuntu-latest
+    steps:
+      - id: inputs
+        run: |
+          echo "::set-output name=environment::${{ inputs.environment || github.event.inputs.environment || 'dev' }}"
+          echo "::set-output name=branch-name::${{ inputs.branch-name || github.event.inputs.branch-name }}"
+          echo "::set-output name=version::${{ inputs.version || 'latest' }}"
+          echo "::set-output name=apply::${{ inputs.apply || github.event.inputs.apply }}"
+
+      - id: env
+        uses: ASzc/change-string-case-action@v2
+        with:
+          string: ${{ steps.inputs.outputs.environment }}
+
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.inputs.outputs.branch-name }}
+
+      - name: Setup github credentials
+        uses: fusion-engineering/setup-git-credentials@v2
+        with:
+          credentials: ${{ secrets.GIT_CREDENTIALS }}
+
+      - name: Configure AWS credentials development
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
+        if: steps.inputs.outputs.environment != 'prod'
+
+      - name: Configure AWS credentials production
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+        if: steps.inputs.outputs.environment == 'prod'
+
+      - name: Get hcl backend file
+        id: tf-backend
+        working-directory: ./infrastructure/terraform
+        env:
+          ENV: ${{ steps.inputs.outputs.environment }}
+        run: |
+          echo "::set-output name=file::${{ steps.inputs.outputs.environment == 'prod' && 'backend-prod.hcl' || 'backend.hcl' }}"
+
+      - name: Read terraform version file
+        id: tf-version
+        working-directory: ./infrastructure/terraform
+        run: echo "::set-output name=version::$(cat .terraform-version)"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ steps.tf-version.outputs.version }}
+
+      - name: Terraform Format
+        id: fmt
+        working-directory: ./infrastructure/terraform
+        run: terraform fmt -check
+
+      - name: Terraform Init
+        id: init
+        working-directory: ./infrastructure/terraform
+        run: terraform init -backend-config=${{ steps.tf-backend.outputs.file }}
+
+      - name: Terraform new Workspace
+        env:
+          WORKSPACE: ${{ steps.inputs.outputs.environment }}
+        working-directory: ./infrastructure/terraform
+        run: terraform workspace new ${WORKSPACE}
+        continue-on-error: true
+
+      - name: Terraform select Workspace
+        env:
+          WORKSPACE: ${{ steps.inputs.outputs.environment }}
+        working-directory: ./infrastructure/terraform
+        run: terraform workspace select ${WORKSPACE}
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ./infrastructure/terraform
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./infrastructure/terraform
+        run: terraform plan -no-color -var "ingestion_api_key=${{ secrets[format('INGESTION_API_KEY_{0}', steps.env.outputs.uppercase )] }}" -var "new_relic_insert_api_key=${{ secrets.NEW_RELIC_INSERT_API_KEY }}" -var "image_version=${{ steps.inputs.outputs.version }}"
+        continue-on-error: true
+
+      - uses: actions/github-script@0.9.0
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Terraform Apply
+        working-directory: ./infrastructure/terraform
+        if: steps.inputs.outputs.apply == 'true' || github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve -var "ingestion_api_key=${{ secrets[format('INGESTION_API_KEY_{0}', steps.env.outputs.uppercase )] }}" -var "new_relic_insert_api_key=${{ secrets.NEW_RELIC_INSERT_API_KEY }}" -var "image_version=${{ steps.inputs.outputs.version }}"

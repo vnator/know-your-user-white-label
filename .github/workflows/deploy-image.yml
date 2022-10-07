@@ -1,0 +1,113 @@
+name: 'Upload docker image'
+
+on:
+  push:
+    paths-ignore:
+      - 'infrastructure/**'
+      - 'README.md'
+      - '.github/**'
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'environment to be deployed'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      branch-name:
+        description: 'Branch name'
+        required: true
+        default: 'main'
+
+  workflow_call:
+    inputs:
+      environment:
+        description: 'environment to be deployed'
+        required: true
+        type: string
+      version:
+        description: 'Release version'
+        required: true
+        type: string
+    secrets:
+      AWS_REGION:
+        required: true
+      AWS_ACCESS_KEY_ID_PROD:
+        required: true
+      AWS_SECRET_ACCESS_KEY_PROD:
+        required: true
+
+jobs:
+  deploy:
+    name: 'Upload docker image'
+    runs-on: ubuntu-latest
+    steps:
+      - id: inputs
+        run: |
+          echo "::set-output name=environment::${{ inputs.environment || github.event.inputs.environment || 'dev' }}"
+          echo "::set-output name=branch-name::${{ inputs.branch-name || github.event.inputs.branch-name }}"
+          echo "::set-output name=version::${{ inputs.version || 'latest' }}"
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.inputs.outputs.branch-name }}
+
+      - name: Configure AWS credentials development
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
+        if: steps.inputs.outputs.environment != 'prod'
+
+      - name: Configure AWS credentials production
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+        if: steps.inputs.outputs.environment == 'prod'
+
+      - name: Login to ECR
+        id: ecr
+        uses: jwalton/gh-ecr-login@v1
+        with:
+          region: ${{ env.AWS_REGION }}
+          access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 16
+          cache: 'yarn'
+
+      - name: Deploy
+        env:
+          URL: ${{ steps.ecr.outputs.account }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ steps.inputs.outputs.environment }}/acquisition/repository
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+          docker login --username AWS --password-stdin ${URL}
+          docker build -t ${URL}:${{ github.sha }} -t ${URL}:latest -t ${URL}:${{ steps.inputs.outputs.version }} .
+          docker push ${URL}:${{ github.sha }}
+          docker push ${URL}:latest
+          docker push ${URL}:${{ steps.inputs.outputs.version }}
+          aws ecs update-service --region ${{ secrets.AWS_REGION }} \
+          --cluster kyc-${{ steps.inputs.outputs.environment }}-cluster \
+          --service kyc-${{ steps.inputs.outputs.environment }}-service \
+          --force-new-deployment
+
+      - name: Restart service
+        run: |
+          aws ecs update-service --region ${{ secrets.AWS_REGION }} \
+          --cluster kyc-${{ steps.inputs.outputs.environment }}-cluster \
+          --service kyc-${{ steps.inputs.outputs.environment }}-service \
+          --force-new-deployment
+        if: steps.inputs.outputs.version == 'latest'
